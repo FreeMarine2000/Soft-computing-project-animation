@@ -1,0 +1,1036 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>C.E.N.T.A.U.R — 3D Top-Down</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    background:#0d0d0d;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    min-height:100vh;
+    font-family:'Courier New', monospace;
+  }
+  #title {
+    color:#e0e0e0;
+    font-size:0.75rem;
+    letter-spacing:0.35em;
+    margin-bottom:10px;
+    text-transform:uppercase;
+    opacity:0.7;
+  }
+  canvas { display:block; }
+  #hud {
+    display:flex;
+    gap:30px;
+    margin-top:10px;
+    color:#aaa;
+    font-size:0.6rem;
+    letter-spacing:0.15em;
+  }
+  #phase-label {
+    color:#fff;
+    font-size:0.65rem;
+    letter-spacing:0.2em;
+    margin-top:6px;
+    min-height:1em;
+    opacity:0.8;
+  }
+</style>
+</head>
+<body>
+
+<div id="title">C · E · N · T · A · U · R &nbsp;|&nbsp; OBSTACLE NAVIGATION SIM</div>
+<canvas id="c" width="720" height="540"></canvas>
+<div id="phase-label">[ INITIALIZING ]</div>
+<div id="hud">
+  <span id="h1">THREAT: —</span>
+  <span id="h2">PATH: —</span>
+  <span id="h3">STATE: —</span>
+</div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+
+// ─── ISOMETRIC CONFIG ──────────────────────────────────────────
+const TILE = 52;          // tile size in iso units
+const COLS = 8, ROWS = 8;
+const ORIG_X = W / 2;    // iso origin (top of diamond grid)
+const ORIG_Y = 80;
+
+function isoX(c, r) { return ORIG_X + (c - r) * TILE; }
+function isoY(c, r) { return ORIG_Y + (c + r) * (TILE * 0.5); }
+
+// Convert tile center to screen
+function tileCenter(c, r) {
+  return { x: isoX(c, r), y: isoY(c, r) + TILE * 0.25 };
+}
+
+// ─── SCENE LAYOUT ─────────────────────────────────────────────
+// Grid: 8×8
+// Barrel at tile (1, 1) — top-left area
+// Door  at right wall: tile (7, 4)
+// Stickman at tile (6, 6) — bottom-right area
+// Robot starts at tile (1, 4) — left side
+
+// Path: robot navigates from (1,4) → (3,4) → (3,6) → (5,6) → (5,4) → (7,4) [door]
+const PATH_TILES = [
+  [1,4],[2,4],[3,4],[3,5],[3,6],[4,6],[5,6],[5,5],[5,4],[6,4],[7,4]
+];
+
+// ─── STATE ────────────────────────────────────────────────────
+let t = 0;
+let phase = 0;          // 0=idle/scan, 1=move, 2=at door
+let phaseTimer = 0;
+let pathProgress = 0;   // 0..1 along full path
+let robotTile = 0;      // index in PATH_TILES currently at
+let robotSubP = 0;      // interpolation between tiles 0..1
+let scanPulse = 0;
+let scanRings = [];
+let decisionAlpha = 0;
+
+// ─── GRAYSCALE PALETTE ────────────────────────────────────────
+const C = {
+  bg:       '#0d0d0d',
+  floorA:   '#1a1a1a',
+  floorB:   '#222222',
+  gridLine: '#333333',
+  wallTop:  '#2a2a2a',
+  wallFace: '#1e1e1e',
+  wallEdge: '#444444',
+  doorFill: '#141414',
+  doorFrame:'#555555',
+  pathLine: '#888888',
+  pathDot:  '#cccccc',
+  robotBody:'#ddd',
+  robotDark:'#555',
+  barrel:   '#444',
+  barrelTop:'#555',
+  hostile:  '#bbb',
+  gun:      '#999',
+  gunDark:  '#333',
+  scanLine: '#777',
+  threatBox:'#aaa',
+  white:    '#f0f0f0',
+  dimWhite: '#888',
+};
+
+// ─── HELPERS ──────────────────────────────────────────────────
+function lerp(a,b,t){ return a+(b-a)*t; }
+function easeInOut(x){ return x<0.5?2*x*x:1-Math.pow(-2*x+2,2)/2; }
+function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
+
+// ─── DRAW FLOOR GRID ──────────────────────────────────────────
+function drawFloor() {
+  for(let r=0;r<ROWS;r++){
+    for(let c=0;c<COLS;c++){
+      let x0 = isoX(c,r),   y0 = isoY(c,r);
+      let x1 = isoX(c+1,r), y1 = isoY(c+1,r);
+      let x2 = isoX(c+1,r+1), y2 = isoY(c+1,r+1);
+      let x3 = isoX(c,r+1), y3 = isoY(c,r+1);
+
+      // Checkerboard
+      ctx.fillStyle = (c+r)%2===0 ? C.floorA : C.floorB;
+      ctx.beginPath();
+      ctx.moveTo(x0,y0); ctx.lineTo(x1,y1);
+      ctx.lineTo(x2,y2); ctx.lineTo(x3,y3);
+      ctx.closePath();
+      ctx.fill();
+
+      // Grid line
+      ctx.strokeStyle = C.gridLine;
+      ctx.lineWidth = 0.7;
+      ctx.stroke();
+
+      // Tile coordinate mark (small)
+      let cx = (x0+x1+x2+x3)/4;
+      let cy = (y0+y1+y2+y3)/4 - 2;
+      ctx.font = '6px Courier New';
+      ctx.fillStyle = '#2a2a2a';
+      ctx.textAlign = 'center';
+      ctx.fillText(`${c},${r}`, cx, cy+2);
+    }
+  }
+}
+
+// ─── DRAW WALLS ───────────────────────────────────────────────
+const WALL_H = 55;  // pixel height of walls
+
+function drawWall(c0,r0,c1,r1, face='left') {
+  let ax = isoX(c0,r0), ay = isoY(c0,r0);
+  let bx = isoX(c1,r1), by = isoY(c1,r1);
+
+  // Face (vertical drop)
+  ctx.fillStyle = C.wallFace;
+  ctx.beginPath();
+  ctx.moveTo(ax, ay);
+  ctx.lineTo(bx, by);
+  ctx.lineTo(bx, by+WALL_H);
+  ctx.lineTo(ax, ay+WALL_H);
+  ctx.closePath();
+  ctx.fill();
+
+  // Edge lighting
+  ctx.strokeStyle = C.wallEdge;
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Top edge
+  ctx.strokeStyle = '#555';
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  ctx.moveTo(ax,ay); ctx.lineTo(bx,by); ctx.stroke();
+}
+
+// Draw all 4 walls (closed room)
+function drawRoom() {
+  // Determine door position on right wall at row=4
+  const DOOR_R = 4;
+
+  // Back-left wall (r=0 edge, c=0..8)
+  for(let c=0;c<COLS;c++){
+    drawWall(c,0, c+1,0);
+  }
+
+  // Back-right wall (c=0 edge, r=0..8)
+  for(let r=0;r<ROWS;r++){
+    drawWall(0,r, 0,r+1);
+  }
+
+  // Front-left wall (c=COLS edge, r=0..8) — right side, has door
+  for(let r=0;r<ROWS;r++){
+    if(r === DOOR_R) {
+      drawDoor(COLS, r);
+    } else {
+      drawWall(COLS, r, COLS, r+1);
+    }
+  }
+
+  // Front-right wall (r=ROWS edge, c=0..8)
+  for(let c=0;c<COLS;c++){
+    drawWall(c, ROWS, c+1, ROWS);
+  }
+
+  // Corner pillars
+  drawPillar(0,0);
+  drawPillar(COLS,0);
+  drawPillar(0,ROWS);
+  drawPillar(COLS,ROWS);
+}
+
+function drawPillar(c,r){
+  let x = isoX(c,r), y = isoY(c,r);
+  ctx.fillStyle = '#555';
+  ctx.strokeStyle = '#666';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.arc(x, y+WALL_H/2, 4, 0, Math.PI*2);
+  ctx.fill(); ctx.stroke();
+  ctx.strokeStyle = '#444';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(x,y); ctx.lineTo(x,y+WALL_H); ctx.stroke();
+}
+
+function drawDoor(c, r) {
+  let ax = isoX(c, r),   ay = isoY(c, r);
+  let bx = isoX(c, r+1), by = isoY(c, r+1);
+
+  let dw = Math.hypot(bx-ax, by-ay);
+  let dh = WALL_H;
+
+  // Door frame
+  ctx.strokeStyle = C.doorFrame;
+  ctx.lineWidth = 2.5;
+  ctx.fillStyle = '#111';
+  ctx.beginPath();
+  ctx.moveTo(ax, ay);
+  ctx.lineTo(bx, by);
+  ctx.lineTo(bx, by+dh*0.85);
+  ctx.lineTo(ax, ay+dh*0.85);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  // Door panel inset
+  let mx = (ax+bx)/2, my = (ay+by)/2;
+  ctx.strokeStyle = '#555';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(ax+4, ay+4);
+  ctx.lineTo(bx-4, by+4);
+  ctx.lineTo(bx-4, by+dh*0.8);
+  ctx.lineTo(ax+4, ay+dh*0.8);
+  ctx.closePath();
+  ctx.stroke();
+
+  // Door handle
+  ctx.fillStyle = '#888';
+  ctx.beginPath();
+  ctx.arc(ax+12, ay+dh*0.45, 2.5, 0, Math.PI*2);
+  ctx.fill();
+
+  // DOOR label
+  ctx.save();
+  ctx.font = 'bold 7px Courier New';
+  ctx.fillStyle = '#666';
+  ctx.textAlign = 'center';
+  ctx.fillText('EXIT', mx, ay - 4);
+  ctx.restore();
+}
+
+// ─── PATH DRAWING ─────────────────────────────────────────────
+function drawPath(upToT) {
+  if(upToT <= 0) return;
+
+  // Draw full intended path (ghost)
+  ctx.setLineDash([4, 6]);
+  ctx.strokeStyle = '#333';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  PATH_TILES.forEach(([c,r], i) => {
+    let {x,y} = tileCenter(c,r);
+    if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  });
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Draw traversed path (bright)
+  let totalSegs = PATH_TILES.length - 1;
+  let currentSeg = upToT * totalSegs;
+  let fullSegs = Math.floor(currentSeg);
+  let frac = currentSeg - fullSegs;
+
+  if(fullSegs > 0) {
+    ctx.strokeStyle = C.pathLine;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for(let i=0;i<=fullSegs && i<PATH_TILES.length;i++){
+      let [c,r] = PATH_TILES[i];
+      let {x,y} = tileCenter(c,r);
+      if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    // partial last segment
+    if(fullSegs < totalSegs) {
+      let [c0,r0] = PATH_TILES[fullSegs];
+      let [c1,r1] = PATH_TILES[fullSegs+1];
+      let p0 = tileCenter(c0,r0);
+      let p1 = tileCenter(c1,r1);
+      ctx.lineTo(lerp(p0.x,p1.x,frac), lerp(p0.y,p1.y,frac));
+    }
+    ctx.stroke();
+  }
+
+  // Waypoint dots
+  PATH_TILES.forEach(([c,r], i) => {
+    let {x,y} = tileCenter(c,r);
+    let visited = i / totalSegs <= upToT;
+    ctx.fillStyle = visited ? C.pathDot : '#333';
+    ctx.strokeStyle = visited ? C.white : '#444';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(x, y, visited ? 3 : 2, 0, Math.PI*2);
+    ctx.fill(); ctx.stroke();
+  });
+
+  // Arrow at head
+  if(upToT < 1 && upToT > 0.02) {
+    let seg = Math.min(fullSegs, totalSegs-1);
+    let [c0,r0] = PATH_TILES[seg];
+    let [c1,r1] = PATH_TILES[Math.min(seg+1,totalSegs)];
+    let p0 = tileCenter(c0,r0);
+    let p1 = tileCenter(c1,r1);
+    let hx = lerp(p0.x,p1.x,frac);
+    let hy = lerp(p0.y,p1.y,frac);
+    let ang = Math.atan2(p1.y-p0.y, p1.x-p0.x);
+    ctx.save();
+    ctx.translate(hx, hy);
+    ctx.rotate(ang);
+    ctx.fillStyle = '#ccc';
+    ctx.beginPath();
+    ctx.moveTo(8,0); ctx.lineTo(-4,4); ctx.lineTo(-4,-4);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  // Highlight current tile
+  if(upToT > 0 && upToT < 1) {
+    let idx = Math.min(fullSegs, totalSegs);
+    let [cc, rr] = PATH_TILES[idx];
+    drawTileHighlight(cc, rr, 'rgba(200,200,200,0.12)');
+  }
+}
+
+function drawTileHighlight(c, r, col) {
+  let x0=isoX(c,r), y0=isoY(c,r);
+  let x1=isoX(c+1,r), y1=isoY(c+1,r);
+  let x2=isoX(c+1,r+1), y2=isoY(c+1,r+1);
+  let x3=isoX(c,r+1), y3=isoY(c,r+1);
+  ctx.fillStyle = col;
+  ctx.beginPath();
+  ctx.moveTo(x0,y0); ctx.lineTo(x1,y1);
+  ctx.lineTo(x2,y2); ctx.lineTo(x3,y3);
+  ctx.closePath();
+  ctx.fill();
+}
+
+// ─── BARREL ───────────────────────────────────────────────────
+function drawBarrel(c, r) {
+  let {x,y} = tileCenter(c,r);
+  y -= 6;
+
+  let rx = 11, rh = 28;
+
+  // Shadow ellipse
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.beginPath();
+  ctx.ellipse(x, y+rh*0.5+6, rx+4, 5, 0, 0, Math.PI*2);
+  ctx.fill();
+
+  // Barrel body gradient
+  let bg = ctx.createLinearGradient(x-rx,0,x+rx,0);
+  bg.addColorStop(0,'#1a1a1a');
+  bg.addColorStop(0.4,'#555');
+  bg.addColorStop(0.8,'#3a3a3a');
+  bg.addColorStop(1,'#111');
+  ctx.fillStyle = bg;
+  ctx.strokeStyle = '#666';
+  ctx.lineWidth = 1;
+
+  // Body
+  ctx.beginPath();
+  ctx.ellipse(x, y-rh*0.5, rx, 5, 0, Math.PI, 0);
+  ctx.rect(x-rx, y-rh*0.5, rx*2, rh);
+  ctx.ellipse(x, y+rh*0.5, rx, 5, 0, 0, Math.PI);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.ellipse(x, y+rh*0.5, rx, 5, 0, 0, Math.PI*2);
+  ctx.stroke();
+
+  // Rings
+  [0, 0.3, 0.7, 1].forEach(pct => {
+    let ry2 = y - rh*0.5 + rh*pct;
+    ctx.strokeStyle = '#666';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.ellipse(x, ry2, rx, 4, 0, 0, Math.PI*2);
+    ctx.stroke();
+  });
+
+  // Top face (lit)
+  ctx.fillStyle = C.barrelTop;
+  ctx.strokeStyle = '#777';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.ellipse(x, y-rh*0.5, rx, 5, 0, 0, Math.PI*2);
+  ctx.fill(); ctx.stroke();
+
+  // Warning symbol
+  ctx.fillStyle = '#888';
+  ctx.font = 'bold 10px Courier New';
+  ctx.textAlign = 'center';
+  ctx.fillText('!', x, y+3);
+
+  // Flame flicker on top
+  let fh = 8 + Math.sin(t*0.18)*3;
+  ctx.globalAlpha = 0.7;
+  ctx.fillStyle = '#aaa';
+  ctx.beginPath();
+  ctx.ellipse(x, y-rh*0.5-fh*0.5, 5, fh*0.5, Math.sin(t*0.1)*0.3, 0, Math.PI*2);
+  ctx.fill();
+  ctx.globalAlpha = 0.4;
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.ellipse(x, y-rh*0.5-fh*0.3, 2, fh*0.3, Math.sin(t*0.13)*0.2, 0, Math.PI*2);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+
+  // Label
+  ctx.font = '6px Courier New';
+  ctx.fillStyle = '#555';
+  ctx.fillText('BARREL', x, y+rh*0.5+16);
+}
+
+// ─── STICKMAN + GUN ───────────────────────────────────────────
+function drawStickman(c, r) {
+  let {x,y} = tileCenter(c,r);
+  y -= 4;
+
+  const hs = 10; // head size
+  const th = 28; // torso height
+
+  // Shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.beginPath();
+  ctx.ellipse(x, y+4, 14, 5, 0, 0, Math.PI*2);
+  ctx.fill();
+
+  // Body lines
+  ctx.strokeStyle = C.hostile;
+  ctx.lineWidth = 2.5;
+  ctx.lineCap = 'round';
+
+  // Torso
+  ctx.beginPath();
+  ctx.moveTo(x, y-hs-2);
+  ctx.lineTo(x, y-hs-th);
+  ctx.stroke();
+
+  // Legs
+  ctx.beginPath();
+  ctx.moveTo(x, y-hs-2);
+  ctx.lineTo(x-10, y+2);
+  ctx.moveTo(x, y-hs-2);
+  ctx.lineTo(x+10, y+2);
+  ctx.stroke();
+
+  // Left arm (down)
+  ctx.beginPath();
+  ctx.moveTo(x, y-hs-th*0.65);
+  ctx.lineTo(x+10, y-hs-th*0.35);
+  ctx.stroke();
+
+  // Right arm (aiming the gun — extended left/forward)
+  let armAng = -0.3 + Math.sin(t*0.05)*0.05; // slight sway
+  let armLen = 22;
+  let armEx = x - Math.cos(armAng)*armLen;
+  let armEy = y-hs-th*0.7 + Math.sin(armAng)*armLen*0.3;
+
+  ctx.beginPath();
+  ctx.moveTo(x, y-hs-th*0.7);
+  ctx.lineTo(armEx, armEy);
+  ctx.stroke();
+
+  // Head
+  ctx.fillStyle = '#2a2a2a';
+  ctx.strokeStyle = C.hostile;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(x, y-hs-th-hs*0.5, hs, 0, Math.PI*2);
+  ctx.fill(); ctx.stroke();
+
+  // Eyes (two dots)
+  ctx.fillStyle = C.white;
+  ctx.beginPath();
+  ctx.arc(x-3.5, y-hs-th-hs*0.6, 1.8, 0, Math.PI*2);
+  ctx.arc(x+3.5, y-hs-th-hs*0.6, 1.8, 0, Math.PI*2);
+  ctx.fill();
+
+  // ── DETAILED GUN ──────────────────────────────────────────
+  let gx = armEx, gy = armEy;
+  ctx.save();
+  ctx.translate(gx, gy);
+  ctx.rotate(armAng - 0.1);
+
+  // Receiver / main body
+  let recGrad = ctx.createLinearGradient(-26,0,-26,10);
+  recGrad.addColorStop(0,'#888');
+  recGrad.addColorStop(0.5,'#444');
+  recGrad.addColorStop(1,'#222');
+  ctx.fillStyle = recGrad;
+  ctx.strokeStyle = '#999';
+  ctx.lineWidth = 0.8;
+  // Receiver body
+  ctx.beginPath();
+  ctx.roundRect(-26, -4, 22, 8, 2);
+  ctx.fill(); ctx.stroke();
+
+  // Barrel
+  ctx.fillStyle = '#555';
+  ctx.strokeStyle = '#888';
+  ctx.lineWidth = 0.8;
+  ctx.beginPath();
+  ctx.roundRect(-52, -2.5, 28, 5, 1);
+  ctx.fill(); ctx.stroke();
+
+  // Barrel shroud details (rail)
+  ctx.strokeStyle = '#777';
+  ctx.lineWidth = 0.6;
+  for(let i=-50;i<-28;i+=5){
+    ctx.beginPath();
+    ctx.moveTo(i,-3); ctx.lineTo(i,-1); ctx.stroke();
+  }
+
+  // Muzzle brake
+  ctx.fillStyle = '#333';
+  ctx.strokeStyle = '#666';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.roundRect(-58, -4, 8, 8, 1);
+  ctx.fill(); ctx.stroke();
+  // Muzzle ports
+  ctx.strokeStyle = '#222';
+  ctx.lineWidth = 0.8;
+  [-56,-53,-50].forEach(mx => {
+    ctx.beginPath();
+    ctx.moveTo(mx,-3.5); ctx.lineTo(mx,-1); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(mx,1); ctx.lineTo(mx,3.5); ctx.stroke();
+  });
+
+  // Trigger guard
+  ctx.strokeStyle = '#777';
+  ctx.lineWidth = 1.2;
+  ctx.fillStyle = 'transparent';
+  ctx.beginPath();
+  ctx.arc(-14, 6, 5, 0, Math.PI);
+  ctx.stroke();
+
+  // Trigger
+  ctx.strokeStyle = '#888';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(-14,3); ctx.lineTo(-15,8); ctx.stroke();
+
+  // Grip / handle
+  let gripGrad = ctx.createLinearGradient(-8,4,-8,18);
+  gripGrad.addColorStop(0,'#555');
+  gripGrad.addColorStop(1,'#1a1a1a');
+  ctx.fillStyle = gripGrad;
+  ctx.strokeStyle = '#777';
+  ctx.lineWidth = 0.8;
+  ctx.beginPath();
+  ctx.roundRect(-10, 3, 8, 16, [0,0,3,3]);
+  ctx.fill(); ctx.stroke();
+  // Grip texture
+  ctx.strokeStyle = '#333';
+  ctx.lineWidth = 0.5;
+  for(let gy2=6;gy2<18;gy2+=2.5){
+    ctx.beginPath();
+    ctx.moveTo(-10,gy2); ctx.lineTo(-3,gy2); ctx.stroke();
+  }
+
+  // Magazine
+  ctx.fillStyle = '#3a3a3a';
+  ctx.strokeStyle = '#666';
+  ctx.lineWidth = 0.8;
+  ctx.beginPath();
+  ctx.roundRect(-16, 3, 6, 13, [0,0,2,2]);
+  ctx.fill(); ctx.stroke();
+
+  // Sight (rear)
+  ctx.fillStyle = '#777';
+  ctx.beginPath();
+  ctx.rect(-24,-7,4,3);
+  ctx.fill();
+  ctx.fillStyle = '#222';
+  ctx.beginPath();
+  ctx.rect(-23,-6,2,2);
+  ctx.fill();
+
+  // Sight (front)
+  ctx.fillStyle = '#777';
+  ctx.beginPath();
+  ctx.rect(-48,-7,3,4);
+  ctx.fill();
+
+  // Muzzle flash (occasional)
+  if(Math.sin(t * 0.11) > 0.85) {
+    ctx.globalAlpha = 0.9;
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.ellipse(-68, 0, 10, 5, 0, 0, Math.PI*2);
+    ctx.fill();
+    ctx.globalAlpha = 0.5;
+    ctx.fillStyle = '#ddd';
+    ctx.beginPath();
+    ctx.ellipse(-64, -4, 4, 2, -0.4, 0, Math.PI*2);
+    ctx.ellipse(-64, 4, 4, 2, 0.4, 0, Math.PI*2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  ctx.restore();
+
+  // Label
+  ctx.font = '6px Courier New';
+  ctx.fillStyle = '#555';
+  ctx.textAlign = 'center';
+  ctx.fillText('HOSTILE', x, y+12);
+}
+
+// ─── BUG ROBOT ────────────────────────────────────────────────
+function getRobotPos() {
+  let totalSegs = PATH_TILES.length - 1;
+  let currentSeg = pathProgress * totalSegs;
+  let seg = Math.floor(currentSeg);
+  let frac = currentSeg - seg;
+  seg = clamp(seg, 0, totalSegs - 1);
+
+  let [c0,r0] = PATH_TILES[seg];
+  let [c1,r1] = PATH_TILES[Math.min(seg+1, totalSegs)];
+  let p0 = tileCenter(c0,r0);
+  let p1 = tileCenter(c1,r1);
+  let ef = easeInOut(frac);
+  return {
+    x: lerp(p0.x, p1.x, ef),
+    y: lerp(p0.y, p1.y, ef)
+  };
+}
+
+function drawBugBot(pos) {
+  let {x, y} = pos;
+  let rx = x, ry = y - 8;
+
+  const moving = phase === 1;
+  const legWave = moving ? t * 0.2 : t * 0.06;
+  const bodyAlpha = 1;
+
+  ctx.save();
+  ctx.translate(rx, ry);
+
+  // Body glow (subtle white)
+  let grd = ctx.createRadialGradient(0,0,0,0,0,35);
+  grd.addColorStop(0,'rgba(255,255,255,0.06)');
+  grd.addColorStop(1,'transparent');
+  ctx.fillStyle = grd;
+  ctx.beginPath(); ctx.arc(0,0,35,0,Math.PI*2); ctx.fill();
+
+  // ── 6 LEGS ──
+  ctx.strokeStyle = '#777';
+  ctx.lineWidth = 1.8;
+  ctx.lineCap = 'round';
+  const legDefs = [
+    [-14,-6,  -28,-16+Math.sin(legWave)*6,    -36,-10+Math.sin(legWave)*6],
+    [-14, 0,  -30, 0+Math.sin(legWave+1)*5,   -38,  6+Math.sin(legWave+1)*5],
+    [-14, 6,  -26, 14+Math.sin(legWave+2)*6,  -34, 18+Math.sin(legWave+2)*6],
+    [ 14,-6,   28,-16+Math.sin(legWave+3)*6,   36,-10+Math.sin(legWave+3)*6],
+    [ 14, 0,   30, 0+Math.sin(legWave+4)*5,    38,  6+Math.sin(legWave+4)*5],
+    [ 14, 6,   26, 14+Math.sin(legWave+5)*6,   34, 18+Math.sin(legWave+5)*6],
+  ];
+  legDefs.forEach(([x1,y1,x2,y2,x3,y3])=>{
+    ctx.beginPath();
+    ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.lineTo(x3,y3);
+    ctx.stroke();
+    ctx.fillStyle = '#555';
+    ctx.beginPath(); ctx.arc(x3,y3,2,0,Math.PI*2); ctx.fill();
+  });
+
+  // ── BODY SHELL ──
+  let bg = ctx.createLinearGradient(-18,-10,18,10);
+  bg.addColorStop(0,'#2a2a2a');
+  bg.addColorStop(0.4,'#555');
+  bg.addColorStop(0.7,'#3a3a3a');
+  bg.addColorStop(1,'#1a1a1a');
+  ctx.fillStyle = bg;
+  ctx.strokeStyle = '#888';
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, 18, 11, 0, 0, Math.PI*2);
+  ctx.fill(); ctx.stroke();
+
+  // Segments
+  ctx.strokeStyle = '#444';
+  ctx.lineWidth = 0.8;
+  ctx.beginPath();
+  ctx.ellipse(0,0,10,7,0,0,Math.PI*2); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(-18,0); ctx.lineTo(18,0); ctx.stroke();
+
+  // Abdomen detail
+  ctx.strokeStyle = '#333';
+  [-6,0,6].forEach(lx => {
+    ctx.beginPath(); ctx.moveTo(lx,-11); ctx.lineTo(lx,11); ctx.stroke();
+  });
+
+  // ── HEAD ──
+  let hg = ctx.createLinearGradient(14,-8,30,8);
+  hg.addColorStop(0,'#555');
+  hg.addColorStop(1,'#222');
+  ctx.fillStyle = hg;
+  ctx.strokeStyle = '#999';
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  ctx.ellipse(22, 0, 10, 8, 0, 0, Math.PI*2);
+  ctx.fill(); ctx.stroke();
+
+  // Eyes — 4 compound
+  const eyeColor = phase===0 ? '#ccc' : phase===1 ? (Math.sin(t*0.3)>0?'#fff':'#888') : '#eee';
+  ctx.shadowColor = '#fff';
+  ctx.shadowBlur = phase===1 ? 6 : 3;
+  [[19,-4],[24,-4],[19,3],[24,3]].forEach(([ex,ey]) => {
+    ctx.fillStyle = eyeColor;
+    ctx.beginPath(); ctx.arc(ex,ey,2,0,Math.PI*2); ctx.fill();
+  });
+  ctx.shadowBlur = 0;
+
+  // ── ANTENNAE ──
+  ctx.strokeStyle = '#888';
+  ctx.lineWidth = 1.2;
+  let aw = Math.sin(t*0.1)*5;
+  ctx.beginPath();
+  ctx.moveTo(27,-7);
+  ctx.quadraticCurveTo(34,-18+aw,38,-22+aw);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(27,-3);
+  ctx.quadraticCurveTo(36,-6+aw*0.5,40,-7+aw*0.7);
+  ctx.stroke();
+  ctx.fillStyle = '#ccc';
+  ctx.shadowColor='#fff'; ctx.shadowBlur=4;
+  ctx.beginPath(); ctx.arc(38,-22+aw,2.5,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(40,-7+aw*0.7,1.8,0,Math.PI*2); ctx.fill();
+  ctx.shadowBlur=0;
+
+  // ── SCAN BEAM (phase 0) ──
+  if(phase===0) {
+    let sa = t*0.04;
+    ctx.globalAlpha = 0.2 + 0.1*Math.sin(t*0.1);
+    ctx.strokeStyle = '#ccc';
+    ctx.lineWidth = 0.8;
+    ctx.setLineDash([4,4]);
+    for(let b=-1;b<=1;b++){
+      ctx.beginPath();
+      ctx.moveTo(32,0);
+      ctx.lineTo(32+Math.cos(sa+b*0.25)*90, Math.sin(sa+b*0.25)*90);
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+    ctx.globalAlpha=1;
+  }
+
+  ctx.restore();
+
+  // Label
+  ctx.font = '6px Courier New';
+  ctx.fillStyle = '#666';
+  ctx.textAlign = 'center';
+  ctx.fillText('CENTAUR-BOT', rx, ry+28);
+}
+
+// ─── THREAT BRACKETS ──────────────────────────────────────────
+function drawBrackets(cx, cy, w, h, label, alpha) {
+  if(alpha<=0) return;
+  ctx.globalAlpha = alpha;
+  let cs = 8;
+  let l=cx-w/2, r=cx+w/2, top=cy-h, bot=cy;
+  [[l,top],[r,top],[l,bot],[r,bot]].forEach(([bx,by],i) => {
+    let sx = i%2===0?1:-1, sy = i<2?1:-1;
+    ctx.strokeStyle = '#bbb';
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(bx, by+sy*cs); ctx.lineTo(bx,by); ctx.lineTo(bx+sx*cs,by);
+    ctx.stroke();
+  });
+  ctx.font = '7px Courier New';
+  ctx.fillStyle = '#999';
+  ctx.textAlign = 'center';
+  ctx.fillText(label, cx, top-4);
+  ctx.globalAlpha=1;
+}
+
+// ─── SCAN RINGS ───────────────────────────────────────────────
+function updateScanRings(rx, ry) {
+  if(phase===0 && t%30===0) scanRings.push({x:rx,y:ry,r:0,life:1});
+  scanRings = scanRings.filter(s=>s.life>0);
+  scanRings.forEach(s => {
+    s.r += 2; s.life -= 0.025;
+    ctx.globalAlpha = s.life * 0.4;
+    ctx.strokeStyle = '#aaa';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3,6]);
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI*2); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha=1;
+  });
+}
+
+// ─── DECISION OVERLAY ─────────────────────────────────────────
+function drawDecisionOverlay(rx, ry, alpha) {
+  if(alpha<=0) return;
+  ctx.globalAlpha = alpha;
+
+  let bx = rx+30, by = ry-110;
+  let bw=155, bh=75;
+
+  ctx.fillStyle='#0d0d0d';
+  ctx.strokeStyle='#888';
+  ctx.lineWidth=1;
+  ctx.beginPath();
+  ctx.roundRect(bx,by,bw,bh,4);
+  ctx.fill(); ctx.stroke();
+
+  // Tail
+  ctx.beginPath();
+  ctx.moveTo(bx+8,by+bh);
+  ctx.lineTo(bx,by+bh+10);
+  ctx.lineTo(bx+18,by+bh);
+  ctx.fill();
+
+  const rows=[
+    {l:'THREAT',v:0.88},
+    {l:'CONFIDENCE',v:0.93},
+    {l:'PATH CLEAR',v:0.74},
+  ];
+  ctx.font='7px Courier New';
+  rows.forEach((row,i)=>{
+    let ry2=by+16+i*20;
+    ctx.fillStyle='#555';
+    ctx.textAlign='left';
+    ctx.fillText(row.l, bx+6, ry2);
+    ctx.fillStyle='#1a1a1a';
+    ctx.fillRect(bx+80,ry2-8,65,8);
+    ctx.fillStyle='#aaa';
+    let v=row.v*(0.9+Math.random()*0.1);
+    ctx.fillRect(bx+80,ry2-8,65*v,8);
+    ctx.fillStyle='#888';
+    ctx.textAlign='right';
+    ctx.fillText((v*100).toFixed(0)+'%', bx+bw-3, ry2-1);
+  });
+
+  ctx.font='bold 7px Courier New';
+  ctx.fillStyle='#ccc';
+  ctx.textAlign='left';
+  ctx.fillText('→ NAVIGATE TO EXIT', bx+6, by+bh-8);
+
+  ctx.globalAlpha=1;
+  ctx.textAlign='center';
+}
+
+// ─── HUD UPDATE ───────────────────────────────────────────────
+function updateHUD() {
+  const labels=['SCANNING','MOVING','AT DOOR'];
+  document.getElementById('h1').textContent='THREAT: '+['MED','HIGH','LOW'][phase];
+  document.getElementById('h2').textContent='PATH: '+(pathProgress*100).toFixed(0)+'%';
+  document.getElementById('h3').textContent='STATE: '+['SCANNING','MOVING','AT DOOR'][phase];
+  document.getElementById('phase-label').textContent='[ '+(
+    phase===0?'NEURO-FUZZY SCAN — COMPUTING OPTIMAL PATH':
+    phase===1?'EXECUTING PATH — NAVIGATING TO EXIT':
+    'DESTINATION REACHED — EXITING'
+  )+' ]';
+}
+
+// ─── PHASE MACHINE ────────────────────────────────────────────
+function updatePhase() {
+  phaseTimer++;
+
+  if(phase===0) {
+    decisionAlpha = Math.min(1, phaseTimer/50);
+    if(phaseTimer>160) { phase=1; phaseTimer=0; decisionAlpha=0; }
+  }
+  else if(phase===1) {
+    pathProgress = Math.min(1, phaseTimer / 280);
+    decisionAlpha = 0;
+    if(pathProgress>=1) { phase=2; phaseTimer=0; }
+  }
+  else if(phase===2) {
+    if(phaseTimer>140) {
+      phase=0; phaseTimer=0; pathProgress=0;
+    }
+  }
+}
+
+// ─── SORT ORDER (iso painter's) ───────────────────────────────
+// We need to draw things back-to-front:
+// row 0 first, row N last; within row: col 0 first.
+
+// ─── MAIN DRAW ────────────────────────────────────────────────
+function draw() {
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle=C.bg;
+  ctx.fillRect(0,0,W,H);
+
+  // Floor
+  drawFloor();
+
+  // Path (below objects)
+  drawPath(phase===0 ? 0 : pathProgress);
+
+  // Ghost path when scanning
+  if(phase===0) {
+    ctx.setLineDash([3,5]);
+    ctx.strokeStyle='#2a2a2a';
+    ctx.lineWidth=1;
+    ctx.beginPath();
+    PATH_TILES.forEach(([c,r],i)=>{
+      let {x,y}=tileCenter(c,r);
+      if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    });
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // Room walls (drawn after floor, before objects)
+  drawRoom();
+
+  // Robot pos
+  let botPos = getRobotPos();
+
+  // Scan rings
+  updateScanRings(botPos.x, botPos.y-8);
+
+  // === OBJECTS (painter's order by tile row+col sum) ===
+  // Barrel at (1,1), stickman at (6,6), bot at dynamic
+
+  // Draw barrel (top area — drawn early)
+  drawBarrel(1, 5);
+
+  // Draw bot
+  drawBugBot(botPos);
+
+  // Draw stickman (further in scene but we draw after bot for overlap clarity)
+  drawStickman(6, 6);
+
+  // Threat detection brackets
+  let bracketA = phase===0 ? decisionAlpha : phase===1 ? 1 : Math.max(0,1-phaseTimer/60);
+  let barrelPos = tileCenter(1,5);
+  let stickPos  = tileCenter(6,6);
+  drawBrackets(barrelPos.x+5, barrelPos.y-8, 36, 50, 'FLAMMABLE', bracketA);
+  drawBrackets(stickPos.x, stickPos.y-10, 40, 75, 'HOSTILE', bracketA);
+
+  // Decision bubble
+  if(phase===0) drawDecisionOverlay(botPos.x, botPos.y, decisionAlpha);
+
+  // Door highlight when near
+  if(phase>=1 && pathProgress>0.85) {
+    let doorPos = tileCenter(COLS, 4);
+    ctx.globalAlpha = (pathProgress-0.85)/0.15 * 0.3 + (phase===2?0.5:0);
+    ctx.fillStyle = '#fff';
+    let dx=isoX(COLS,4), dy=isoY(COLS,4);
+    let dx2=isoX(COLS,5), dy2=isoY(COLS,5);
+    ctx.strokeStyle='#ccc';
+    ctx.lineWidth=2;
+    ctx.setLineDash([4,4]);
+    ctx.beginPath();
+    ctx.moveTo(dx,dy+WALL_H*0.5); ctx.lineTo(dx2,dy2+WALL_H*0.5); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha=1;
+  }
+
+  // Corner labels
+  ctx.font='7px Courier New';
+  ctx.fillStyle='#333';
+  ctx.textAlign='left';
+  ctx.fillText('(0,0)', isoX(0,0)+2, isoY(0,0)-2);
+  ctx.textAlign='right';
+  ctx.fillText(`(${COLS},${ROWS})`, isoX(COLS,ROWS)-2, isoY(COLS,ROWS)+20);
+
+  updateHUD();
+}
+  let frameCount = 0;
+  function loop() {
+    t++;
+    updatePhase();
+    draw();
+
+    // --- NEW AUTO-SCREENSHOT CODE ---
+    // Captures a frame every 25 ticks, up to 10 frames
+    if (t % 25 === 0 && frameCount < 10) {
+      frameCount++;
+      let link = document.createElement('a');
+      link.download = `frame_${frameCount}.png`;
+      link.href = canvas.toDataURL('image/png');
+      link.click();
+    }
+    // --------------------------------
+
+    requestAnimationFrame(loop);
+  }
+  loop();
+</script>
+</body>
+</html>

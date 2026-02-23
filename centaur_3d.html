@@ -1011,26 +1011,26 @@ function draw() {
 
   updateHUD();
 }
-  let frameCount = 0;
-  function loop() {
-    t++;
-    updatePhase();
-    draw();
-
-    // --- NEW AUTO-SCREENSHOT CODE ---
-    // Captures a frame every 25 ticks, up to 10 frames
-    if (t % 25 === 0 && frameCount < 10) {
-      frameCount++;
-      let link = document.createElement('a');
-      link.download = `frame_${frameCount}.png`;
-      link.href = canvas.toDataURL('image/png');
-      link.click();
-    }
-    // --------------------------------
-
-    requestAnimationFrame(loop);
+let frameCount = 0;
+function loop() {
+  t++;
+  updatePhase();
+  draw();
+  
+  // --- NEW AUTO-SCREENSHOT CODE ---
+  // Captures a frame every 25 ticks, up to 10 frames
+  if (t % 25 === 0 && frameCount < 10) {
+    frameCount++;
+    let link = document.createElement('a');
+    link.download = `frame_${frameCount}.png`;
+    link.href = canvas.toDataURL('image/png');
+    link.click();
   }
-  loop();
+  // --------------------------------
+
+  requestAnimationFrame(loop);
+}
+loop();
 </script>
 </body>
 </html>
